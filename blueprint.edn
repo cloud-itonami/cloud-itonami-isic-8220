@@ -1,0 +1,11 @@
+{:itonami.blueprint/id "cloud-itonami-8220"
+ :itonami.blueprint/name "Community Call Centre Operations"
+ :itonami.blueprint/isic-rev5 "8220"
+ :itonami.blueprint/domain :commercial/call-centre-services
+ :itonami.blueprint/license "AGPL-3.0-or-later"
+ :itonami.blueprint/social-impact [:data-privacy :worker-safety :local-jobs]
+ :itonami.blueprint/governor :call-centre-governor
+ :itonami.blueprint/robotics true
+ :itonami.blueprint/required-technologies [:robotics :identity :forms :dmn :bpmn :audit-ledger :labor]
+ :itonami.blueprint/optional-technologies [:optimization]
+ :itonami.blueprint/status :public-oss}
