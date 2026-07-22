@@ -22,9 +22,13 @@
 (defn- approve! [actor tid]
   (g/run* actor {:approval {:status :approved :by "campaign-supervisor-1"}} {:thread-id tid :resume? true}))
 
+(defn- reject! [actor tid]
+  (g/run* actor {:approval {:status :rejected :by "campaign-supervisor-1"}} {:thread-id tid :resume? true}))
+
 (defn -main [& _]
   (let [db (store/seed-db)
         supervisor-phase-1 {:actor-id "sup-1" :actor-role :campaign-supervisor :phase 1}
+        supervisor-phase-2 {:actor-id "sup-1" :actor-role :campaign-supervisor :phase 2}
         supervisor-phase-3 {:actor-id "sup-1" :actor-role :campaign-supervisor :phase 3}
         actor (op/build db)]
 
@@ -34,6 +38,13 @@
       (println r)
       (println "-- human campaign supervisor approves --")
       (println (approve! actor "t1")))
+
+    (println "\n== schedule-staffing-operation campaign-2 (phase 2, escalates -- human REJECTS) ==")
+    (let [r (exec-op actor "t1b" {:op :schedule-staffing-operation :campaign-id "campaign-2"
+                                   :patch {:shift "2026-08-02-night" :agents 3}} supervisor-phase-2)]
+      (println r)
+      (println "-- human campaign supervisor rejects --")
+      (println (reject! actor "t1b")))
 
     (println "\n== log-call-record campaign-1 (phase 3, clean -- auto-commits) ==")
     (println (exec-op actor "t2" {:op :log-call-record :campaign-id "campaign-1"

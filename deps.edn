@@ -1,12 +1,21 @@
 {:paths ["src"]
  :deps {io.github.kotoba-lang/langgraph
-        {:git/sha "a332a770a0d2b5193f81b54483bb954fb29ef8d7"}}
+        {:git/sha "a332a770a0d2b5193f81b54483bb954fb29ef8d7"}
+        ;; langchain-store: the shared langchain.db store seam (EDN-blob
+        ;; codec + identity schema + event-log read/append helpers) that
+        ;; ~190 cloud-itonami actors hand-roll (ADR-2607141600);
+        ;; callcentreops.store's DatomicStore uses it instead of rolling
+        ;; its own enc/dec* two-liner.
+        io.github.kotoba-lang/langchain-store
+        {:git/sha "2615e5213711945491a1b1c953625943c4ea83e1"}}
  :aliases
  {:dev {:override-deps
         {io.github.kotoba-lang/langgraph
          {:local/root "../../kotoba-lang/langgraph"}
          io.github.kotoba-lang/langchain
-         {:local/root "../../kotoba-lang/langchain"}}}
+         {:local/root "../../kotoba-lang/langchain"}
+         io.github.kotoba-lang/langchain-store
+         {:local/root "../../kotoba-lang/langchain-store"}}}
   :run {:main-opts ["-m" "callcentreops.sim"]}
   :test {:extra-paths ["test"]
          :extra-deps {io.github.cognitect-labs/test-runner
