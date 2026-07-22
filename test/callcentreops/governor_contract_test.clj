@@ -117,6 +117,23 @@
       (is (some #(= :committed (:t %)) (store/ledger db))
           "committed fact must be logged after approval"))))
 
+(deftest phase-2-rejected-approval-holds
+  (testing "phase 2 escalated request, human REJECTS -> holds, never commits"
+    (let [db (store/seed-db)
+          actor (op/build db)
+          ctx {:actor-id "test-7b" :phase 2}]
+      (exec-request actor "t7b"
+                     {:op :schedule-staffing-operation :campaign-id "campaign-2"
+                      :patch {:shift "2026-08-02-night" :agents 3}}
+                     ctx)
+      (is (= 0 (count (store/ops-log db)))
+          "phase 2 must not auto-commit, requires approval")
+      (resume-approval actor "t7b" :rejected)
+      (is (= 0 (count (store/ops-log db)))
+          "a rejected approval must never commit")
+      (is (some #(= :approval-rejected (:t %)) (store/ledger db))
+          "the rejection must be logged as an immutable audit fact"))))
+
 (deftest audit-trail-completeness
   (testing "every decision leaves immutable audit facts"
     (let [db (store/seed-db)

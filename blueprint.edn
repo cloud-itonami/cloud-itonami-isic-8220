@@ -9,4 +9,37 @@
  :itonami.blueprint/required-technologies [:robotics :identity :forms :dmn :bpmn :audit-ledger :labor]
  :itonami.blueprint/optional-technologies [:optimization]
  :itonami.blueprint/status :public-oss
- :itonami.blueprint/maturity :implemented}
+ :itonami.blueprint/maturity :implemented
+ :itonami.blueprint/implemented-slice
+ "CallCentreAdvisor ⊣ CallCentreGovernor (three HARD, permanent,
+ un-overridable checks: campaign-unverified, effect-not-propose, and a
+ combined closed-op-allowlist + scope-exclusion scan blocking any
+ proposal that drifts into finalizing a data-privacy-compliance
+ decision), a real compiled langgraph-clj StateGraph (langgraph.graph,
+ callcentreops.operation/build: intake -> advise -> govern -> decide
+ -> commit | request-approval -> commit | hold), a 0-3 rollout-phase
+ gate (callcentreops.phase/gate), and an append-only audit ledger +
+ committed-operations log (callcentreops.store/append-ledger! +
+ commit-record!, both a MemStore defrecord and a DatomicStore backed
+ by langchain.db via langchain-store.core). A back-office OPERATIONS
+ COORDINATION actor for a call-centre service provider running
+ inbound support and outbound telemarketing campaigns -- not
+ data-privacy-compliance-decision authority (a do-not-call-list
+ override, a consent-withdrawal resolution, a GDPR/CCPA compliance
+ ruling, a data-breach determination all stay exclusively human, per
+ ADR-2607152500's Wave-4 person-facing-service guardrail). Four ops
+ (`:log-call-record` / `:schedule-staffing-operation` /
+ `:coordinate-equipment-supply` / `:flag-privacy-concern`), all
+ `:effect :propose` only. `:flag-privacy-concern` ALWAYS escalates to
+ a human campaign supervisor via the compiled graph's
+ `:request-approval` node (`interrupt-before`, checkpoint-based
+ resume) at every phase, never auto-commit-eligible; the other three
+ ops auto-commit only once phase 3 (supervised-auto) is reached and
+ the Governor is clean. Every commit/hold/approval-rejected decision
+ lands in the append-only ledger -- 50 tests / 158 assertions green
+ (`clojure -M:dev:test`) covering the governor's hard checks, the
+ scope-exclusion self-trip regression, phase gating, MemStore ≡
+ DatomicStore parity, and a full compiled-StateGraph integration suite
+ (clean commit, escalate→approve→commit, escalate→reject→hold, and
+ four independent HARD-hold paths); demo runnable end-to-end
+ (`clojure -M:run`)."}

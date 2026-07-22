@@ -78,3 +78,49 @@
           (is (= (count ledger-after-1) (dec (count ledger-after-2))))
           (is (every? #(some (fn [x] (= x %)) ledger-after-2) ledger-after-1)
               "all prior facts must still be present"))))))
+
+;; ----------------------------- MemStore ≡ DatomicStore parity -----------------------------
+;;
+;; Mirrors `cerealops.store-contract-test` (cloud-itonami-isic-0111):
+;; both backends implement the SAME `Store` protocol and must behave
+;; identically for every operation this actor performs.
+
+(deftest mem-and-datomic-seed-parity
+  (let [mem (store/seed-db)
+        dat (store/datomic-seed-db)]
+    (is (= (store/campaign mem "campaign-1") (store/campaign dat "campaign-1")))
+    (is (= (store/campaign mem "campaign-3") (store/campaign dat "campaign-3")))
+    (is (nil? (store/campaign dat "no-such-campaign")))
+    (is (= (set (store/all-campaigns mem)) (set (store/all-campaigns dat))))
+    (is (= 3 (count (store/all-campaigns dat))))))
+
+(deftest mem-and-datomic-mutation-parity
+  (let [mem (store/mem-store {})
+        dat (store/datomic-store {})]
+    (doseq [s [mem dat]]
+      (store/append-ledger! s {:t :committed :op :log-call-record :campaign-id "c1"})
+      (store/append-ledger! s {:t :approval-requested :op :flag-privacy-concern :campaign-id "c1"})
+      (store/commit-record! s {:op :log-call-record :campaign-id "c1" :value {:calls-handled 5}}))
+    (is (= 2 (count (store/ledger mem))))
+    (is (= 2 (count (store/ledger dat))))
+    (is (= (store/ledger mem) (store/ledger dat)))
+    (is (= 1 (count (store/ops-log mem))))
+    (is (= 1 (count (store/ops-log dat))))
+    (is (= (store/ops-log mem) (store/ops-log dat)))))
+
+(deftest datomic-with-campaigns-upserts
+  (let [dat (store/datomic-store {})
+        c1 {:campaign-id "c1" :client "Alice's Bakery Support" :registered? true :verified? true}
+        c1-renamed (assoc c1 :client "Alice's Bakery & Cafe Support")]
+    (store/with-campaigns dat {"c1" c1})
+    (is (= c1 (store/campaign dat "c1")))
+    (store/with-campaigns dat {"c1" c1-renamed})
+    (is (= c1-renamed (store/campaign dat "c1"))
+        "re-registering upserts, not forks history")))
+
+(deftest datomic-empty-with-campaigns-is-a-noop
+  (testing "with-campaigns on an empty map is a no-op (mirrors MemStore's `when (seq campaigns)` guard)"
+    (let [dat (store/datomic-store {"c1" {:campaign-id "c1" :client "X"}})]
+      (store/with-campaigns dat {})
+      (is (some? (store/campaign dat "c1"))
+          "an empty with-campaigns call must not wipe existing campaigns"))))
