@@ -2,10 +2,11 @@
   "CallCentreAdvisor -- the *contained intelligence node* for the
   ISIC-8220 call-centre operations-coordination actor.
 
-  It drafts exactly four kinds of back-office proposal from a closed
+  It drafts exactly five kinds of back-office proposal from a closed
   allowlist: call-record logging, staffing-operation scheduling,
-  telephony-equipment supply coordination, and privacy-concern
-  flagging. CRITICAL: it is a smart-but-untrusted advisor. It returns a
+  telephony-equipment supply coordination, privacy-concern flagging,
+  and -- since ADR-2607264000 -- referring a contact to marketplace
+  dispute intake. CRITICAL: it is a smart-but-untrusted advisor. It returns a
   *proposal* (with a rationale + the fields it cited), never a
   committed record and NEVER a direct actuation -- every proposal's
   `:effect` is always `:propose`. Every output is censored downstream
@@ -35,7 +36,8 @@
      :cites      [str ..]       ; facts/sources the advisor used -- SCANNED too
      :effect     :propose       ; ALWAYS :propose -- never a direct actuation
      :value      map            ; the draft payload a human/system would review
-     :confidence 0..1}")
+     :confidence 0..1}"
+  (:require [marketplace.support :as support]))
 
 (defprotocol Advisor
   (-advise [advisor store request] "store + request -> proposal map"))
@@ -103,10 +105,41 @@
 
 ;; ----------------------------- default mock advisor -----------------------------
 
+(defn- propose-dispute-referral
+  "Refer a support contact to marketplace dispute intake.
+
+  ALWAYS escalates. The caller's own account and the agent's note are
+  kept ATTRIBUTED and SEPARATE by `marketplace.support/referral` --
+  merging them is how an agent's inference quietly becomes part of the
+  buyer's testimony. Nothing here decides anything; the governor rejects
+  any referral carrying an outcome."
+  [_db {:keys [campaign-id patch]}]
+  (let [r (support/referral
+           {:id (:referral-id patch)
+            :ticket-id (:ticket-id patch)
+            :order (:order patch)
+            :buyer (:buyer patch)
+            :seller (:seller patch)
+            :reason (:reason patch)
+            :claimed-by-caller (:claimed-by-caller patch)
+            :agent (:agent patch)
+            :agent-note (:agent-note patch)
+            :referred-at (:referred-at patch)})]
+    {:op :refer-to-dispute
+     :campaign-id campaign-id
+     :summary (str (:ticket-id patch) " の応対を注文 " (:order patch)
+                   " の紛争受付へ照会: " (pr-str (:reason patch)))
+     :rationale "応対内容を紛争受付へ引き継ぐ照会のみ。責任の所在や返金の可否は判断しない。"
+     :cites (vec (keep identity [(:ticket-id patch) (:order patch)]))
+     :effect :propose
+     :value {:referral r}
+     :confidence (or (:confidence patch) 0.85)}))
+
 (defn infer
   "Mock advisor: routes to the correct proposal generator."
   [_db {:keys [op out-of-scope?] :as request}]
   (let [proposal (case op
+                   :refer-to-dispute (propose-dispute-referral _db request)
                    :log-call-record (propose-call-log _db request)
                    :schedule-staffing-operation (propose-staffing-operation _db request)
                    :coordinate-equipment-supply (propose-equipment-supply _db request)

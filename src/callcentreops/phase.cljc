@@ -38,6 +38,12 @@
    1 {:label "assisted-logging"       :writes #{:log-call-record}                                                                :auto #{}}
    2 {:label "assisted-coordination"  :writes #{:log-call-record :schedule-staffing-operation :coordinate-equipment-supply}      :auto #{}}
    3 {:label "supervised-auto"        :writes write-ops
+      ;; NOTE `:refer-to-dispute` is a member of `write-ops` (so phase 3
+      ;; permits it) but is deliberately NOT in `:auto`. An agent's
+      ;; judgement that a call is disputable is exactly the judgement
+      ;; most likely to be shaped by an upset caller on the line, so it
+      ;; always reaches a human -- `callcentreops.governor`'s
+      ;; `always-escalate-ops` agrees independently (ADR-2607264000).
       :auto #{:log-call-record :schedule-staffing-operation :coordinate-equipment-supply}}})
 
 (def default-phase 3)

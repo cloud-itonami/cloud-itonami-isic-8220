@@ -85,8 +85,9 @@
   discovered and fixed by multiple sibling actors in this fleet. See
   `callcentreops.governor-test/no-default-proposal-self-trips-scope-exclusion`
   for the regression test."
-  (:require [clojure.string :as str]
-            [callcentreops.store :as store]))
+  (:require [callcentreops.store :as store]
+            [clojure.string :as str]
+            [marketplace.support :as support]))
 
 (def confidence-floor 0.6)
 
@@ -96,11 +97,22 @@
   None of these ops directly finalizes a data-privacy-compliance
   decision (ADR-2607152500 Wave-4 guardrail)."
   #{:log-call-record :schedule-staffing-operation
-    :coordinate-equipment-supply :flag-privacy-concern})
+    :coordinate-equipment-supply :flag-privacy-concern
+    ;; ADR-2607264000: a buyer who phones to say "my parcel never
+    ;; arrived" used to produce a call record here and nothing at all in
+    ;; the marketplace, so the complaint died in a log. This op refers
+    ;; the contact to dispute intake. It asserts only that the contact
+    ;; was about this order and that the caller claimed X -- see
+    ;; `referral-verdict-violations`.
+    :refer-to-dispute})
 
 (def always-escalate-ops
-  "Ops that ALWAYS require human sign-off, clean or not."
-  #{:flag-privacy-concern})
+  "Ops that ALWAYS require human sign-off, clean or not.
+
+  `:refer-to-dispute` is here because an agent's judgement that a call
+  is disputable is exactly the judgement most likely to be shaped by an
+  upset caller on the line."
+  #{:flag-privacy-concern :refer-to-dispute})
 
 (def scope-excluded-terms
   "Case-insensitive substrings that mark a proposal as touching a
@@ -166,13 +178,34 @@
       [{:rule :scope-excluded
         :detail "データプライバシー・コンプライアンス判断(発信禁止リスト解除の確定、同意撤回請求の解決、GDPR/CCPA準拠判定、データ侵害判断の確定)を直接確定する提案は永久に禁止"}])))
 
+(defn- referral-verdict-violations
+  "For `:refer-to-dispute` ONLY: the referral must be structurally sound
+  and must NOT carry a verdict.
+
+  Delegated to `marketplace.support/referral-errors`, which refuses any
+  referral holding an `:outcome`/`:fault`/`:liable`/`:decision` key. A
+  support agent is the person most likely to form a view about who is at
+  fault, the least equipped to be held to it, and the most trusted by
+  the caller -- so the contract refuses to carry one, and this governor
+  enforces that refusal before the referral can leave the call centre."
+  [proposal]
+  (when (= :refer-to-dispute (:op proposal))
+    (let [r (get-in proposal [:value :referral])]
+      (if-not (map? r)
+        [{:rule :referral-missing :detail "照会レコードの草案がない"}]
+        (when-let [errs (seq (support/referral-errors r))]
+          (mapv (fn [e] {:rule (:support.error/code e)
+                         :detail (or (:support.error/detail e)
+                                     (name (:support.error/code e)))})
+                errs))))))
+
 (defn check
   "Censors a CallCentreAdvisor proposal against the governor rules.
   Returns {:ok? bool :violations [..] :confidence c :escalate? bool
   :high-stakes? bool :hard? bool}."
   [request _context proposal store]
   (let [campaign-id (or (:campaign-id proposal) (:campaign-id request))
-        hard (into []
+        hard (into (vec (referral-verdict-violations proposal))
                    (concat (campaign-unverified-violations {:campaign-id campaign-id} store)
                            (effect-not-propose-violations proposal)
                            (scope-exclusion-violations proposal)))

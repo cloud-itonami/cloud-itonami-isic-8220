@@ -1,5 +1,11 @@
 {:paths ["src"]
- :deps {io.github.kotoba-lang/langgraph
+ :deps {;; marketplace.support: the referral contract that lets a support
+        ;; contact become a dispute without either side deciding anything
+        ;; (ADR-2607264000). referral-errors refuses a referral carrying a
+        ;; verdict, which this actor's governor enforces.
+        io.github.kotoba-lang/marketplace
+        {:local/root "../../kotoba-lang/marketplace"}
+        io.github.kotoba-lang/langgraph
         {:git/sha "a332a770a0d2b5193f81b54483bb954fb29ef8d7"}
         ;; langchain-store: the shared langchain.db store seam (EDN-blob
         ;; codec + identity schema + event-log read/append helpers) that
