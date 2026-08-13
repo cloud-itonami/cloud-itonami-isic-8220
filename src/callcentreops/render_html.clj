@@ -1,0 +1,709 @@
+(ns callcentreops.render-html
+  "Build-time HTML renderer for `docs/samples/operator-console.html`.
+
+  Closes flagship checklist item 2 for `cloud-itonami-isic-8220`: this
+  repo had a product face (`docs/index.html`) but no operator console
+  and no generator that RUNS the actor.
+
+  Everything on the generated page is produced by actually executing
+  this repo's actor stack -- `callcentreops.operation`'s compiled
+  langgraph-clj StateGraph (`langgraph.graph/run*`) ->
+  `callcentreops.governor` -> `callcentreops.store` -- over
+  `callcentreops.store/seed-db`'s real campaign directory. No entity,
+  id, verdict, rule or count below is typed by hand: the campaign rows
+  come from `store/all-campaigns`, the refusal rows from the governor's
+  own `:violations`, the op-contract rows from `governor/allowed-ops` +
+  `governor/always-escalate-ops` + `phase/phases`, and the ledger rows
+  from `store/ledger`.
+
+  Two things this renderer is deliberately careful about, because both
+  are easy to get wrong in a way that still looks right:
+
+  1. A *governor refusal* and a *rollout-phase gate* both land in the
+     ledger as `:t :governor-hold`. They are NOT the same event -- the
+     first is a permanent, un-overridable compliance refusal, the
+     second is \"this op is not switched on at this phase yet\". They
+     are counted separately (`classify-hold`), and the classification
+     keys off the fact TYPE first and never off `:violations` alone:
+     `:t :approval-rejected` (a HUMAN's refusal) also carries a
+     `:violations` entry (`{:rule :approver-rejected}`), so a
+     violations-only test silently reports a human's decision as the
+     governor's.
+
+  2. Who approved a proposal. `operation/commit-fact` stamps `:actor`
+     from `(:actor-id context)` -- the EXECUTING actor, identical on
+     auto-committed and human-approved facts -- so `:actor` cannot
+     answer \"who approved this\". Whether the approver survives
+     anywhere is MEASURED at render time by scanning the ledger and the
+     committed-operations log for approver-shaped keys
+     (`attribution-report`), never asserted as a fixed property of this
+     repo. If someone fixes the store, the page follows.
+
+  Usage: `clojure -M:dev:render-html [out-file]`
+  (default `docs/samples/operator-console.html`).
+
+  The page is deterministic: no timestamps, no per-run UUIDs, no wall
+  clock. Rerunning against the same seed produces a byte-identical
+  file."
+  (:require [jp-go-dds.skin]
+            [clojure.string :as str]
+            [langgraph.graph :as g]
+            [callcentreops.advisor :as advisor]
+            [callcentreops.governor :as governor]
+            [callcentreops.operation :as op]
+            [callcentreops.phase :as phase]
+            [callcentreops.store :as store]))
+
+;; ----------------------------- harness -----------------------------
+
+(def ^:private supervisor
+  "The executing actor's identity. Note this is the ACTOR, not an
+  approver -- see `attribution-report`."
+  {:actor-id "sup-1" :actor-role :campaign-supervisor})
+
+(defn- exec! [actor tid request phase]
+  (g/run* actor
+          {:request request :context (assoc supervisor :phase phase)}
+          {:thread-id tid}))
+
+(defn- resume! [actor tid status by]
+  (g/run* actor
+          {:approval {:status status :by by}}
+          {:thread-id tid :resume? true}))
+
+(defn- run-scenario!
+  "Executes one scenario through `actor` and, if the actor paused for a
+  human (`:disposition :escalate`, the `interrupt-before
+  #{:request-approval}` pause), resumes it with the scenario's declared
+  human decision. Returns the scenario enriched with what the run
+  ACTUALLY produced -- the pre-approval disposition, the final
+  disposition, and the governor verdict -- so the page reports the run
+  rather than the intent."
+  [actor {:keys [tid phase request human-decision] :as scenario}]
+  (let [first-state (:state (exec! actor tid request phase))
+        paused?     (= :escalate (:disposition first-state))
+        final-state (if (and paused? human-decision)
+                      (:state (resume! actor tid
+                                       (:status human-decision)
+                                       (:by human-decision)))
+                      first-state)]
+    (-> scenario
+        (dissoc :request :human-decision)
+        (assoc :op                (:op request)
+               :campaign-id       (:campaign-id request)
+               :paused-for-human? paused?
+               :pre-approval      (:disposition first-state)
+               :disposition       (:disposition final-state)
+               :verdict           (:verdict final-state)
+               :approval          (:approval final-state)))))
+
+;; ----------------------------- the run -----------------------------
+
+(def ^:private sound-referral-patch
+  "A structurally sound dispute referral (ADR-2607264000). Every field
+  is required by `marketplace.support/referral-errors`; `:reason` must
+  come from `marketplace.crossborder/dispute-reasons`."
+  {:referral-id       "ref-1001"
+   :ticket-id         "tkt-88120"
+   :order             "ord-55211"
+   :buyer             "buyer-nakamura"
+   :seller            "seller-northwind-goods"
+   :reason            :not-received
+   :claimed-by-caller "注文した荷物が3週間届いていない"
+   :agent             "agent-17"
+   :agent-note        "追跡番号は発行済み、配送業者側で7/28以降スキャンなし"
+   :referred-at       "2026-08-02"})
+
+(defn- direct-actuation-advisor
+  "An advisor that claims a direct actuation by stamping `:effect
+  :commit` on an otherwise clean proposal -- the failure mode
+  `governor/effect-not-propose-violations` exists to catch."
+  []
+  (reify advisor/Advisor
+    (-advise [_ _store request]
+      (assoc (advisor/infer nil request) :effect :commit))))
+
+(defn- verdict-carrying-advisor
+  "An advisor that decides who was at fault while filing a dispute
+  referral. `marketplace.support/referral-errors` refuses any referral
+  holding `:fault`/`:outcome`/`:liable`/`:decision` (in either the bare
+  or the `:referral/`-qualified form), and this repo's governor
+  enforces that refusal before the referral can leave the call centre."
+  []
+  (reify advisor/Advisor
+    (-advise [_ _store request]
+      (update-in (advisor/infer nil request) [:value :referral]
+                 assoc :referral/fault :seller))))
+
+(defn- unauthorised-op-advisor
+  "An advisor proposing an op that was never on the closed allowlist.
+  `governor/allowed-ops` is a closed set precisely so that an advisor
+  which invents an op -- here, one that would finalize a do-not-call
+  override, the exact territory this actor's charter permanently
+  excludes -- is refused by construction rather than by keyword
+  matching."
+  []
+  (reify advisor/Advisor
+    (-advise [_ _store request]
+      (assoc (advisor/infer nil request) :op :finalize-do-not-call-override))))
+
+(defn run-demo!
+  "Drives one seeded store through every disposition this actor can
+  reach, and returns `{:db .. :scenarios [..]}`.
+
+  Clean paths: a phase-1 call-record log (writes always need approval
+  at phase 1 -- approved), a phase-2 staffing schedule the supervisor
+  REJECTS, three phase-3 auto-commits, a privacy-concern flag and a
+  dispute referral (both ALWAYS escalate at every phase, per
+  `governor/always-escalate-ops`).
+
+  One rollout-phase gate: equipment-supply coordination requested at
+  phase 1, where that op is not switched on yet. The governor is
+  CLEAN -- this is a rollout gate, not a refusal, and the page counts
+  it separately.
+
+  Five governor refusals, each a different rule: an unregistered
+  campaign, a registered-but-unverified campaign, an advisor claiming
+  direct actuation, an advisor drifting into permanently-excluded
+  privacy-compliance-decision scope, an advisor proposing an op that
+  was never on the allowlist, and a dispute referral carrying a
+  verdict."
+  []
+  (let [db      (store/seed-db)
+        actor   (op/build db)
+        direct  (op/build db {:advisor (direct-actuation-advisor)})
+        verdict (op/build db {:advisor (verdict-carrying-advisor)})
+        unauth  (op/build db {:advisor (unauthorised-op-advisor)})
+        run     (fn [a sc] (run-scenario! a sc))]
+    {:db db
+     :scenarios
+     [(run actor
+        {:tid "t1" :phase 1 :kind :clean
+         :label "通話記録のログ (phase 1: 書き込みは必ず人間承認)"
+         :request {:op :log-call-record :campaign-id "campaign-1"
+                   :patch {:calls-handled 42 :avg-handle-time-sec 210 :outcome "resolved"}}
+         :human-decision {:status :approved :by "campaign-supervisor-1"}})
+
+      (run actor
+        {:tid "t2" :phase 2 :kind :clean
+         :label "要員シフト編成 (phase 2: 人間が却下)"
+         :request {:op :schedule-staffing-operation :campaign-id "campaign-2"
+                   :patch {:shift "2026-08-02-night" :agents 3}}
+         :human-decision {:status :rejected :by "campaign-supervisor-1"}})
+
+      (run actor
+        {:tid "t3" :phase 3 :kind :clean
+         :label "通話記録のログ (phase 3: 自動コミット)"
+         :request {:op :log-call-record :campaign-id "campaign-1"
+                   :patch {:calls-handled 51 :avg-handle-time-sec 195}}})
+
+      (run actor
+        {:tid "t4" :phase 3 :kind :clean
+         :label "要員シフト編成 (phase 3: 自動コミット)"
+         :request {:op :schedule-staffing-operation :campaign-id "campaign-1"
+                   :patch {:shift "2026-08-01-morning" :agents 6}}})
+
+      (run actor
+        {:tid "t5" :phase 3 :kind :clean
+         :label "電話設備の調達調整 (phase 3: 自動コミット)"
+         :request {:op :coordinate-equipment-supply :campaign-id "campaign-2"
+                   :patch {:item "headsets" :quantity 10}}})
+
+      (run actor
+        {:tid "t6" :phase 3 :kind :clean
+         :label "プライバシー懸念のフラグ (どの phase でも必ず人間へ)"
+         :request {:op :flag-privacy-concern :campaign-id "campaign-1"
+                   :patch {:concern "unconfirmed do-not-call request received via phone"
+                           :confidence 0.9}}
+         :human-decision {:status :approved :by "campaign-supervisor-1"}})
+
+      (run actor
+        {:tid "t7" :phase 3 :kind :clean
+         :label "応対を紛争受付へ照会 (どの phase でも必ず人間へ)"
+         :request {:op :refer-to-dispute :campaign-id "campaign-2"
+                   :patch sound-referral-patch}
+         :human-decision {:status :approved :by "campaign-supervisor-1"}})
+
+      (run actor
+        {:tid "t8" :phase 1 :kind :phase-gate
+         :label "電話設備の調達調整を phase 1 で要求 (governor は clean)"
+         :request {:op :coordinate-equipment-supply :campaign-id "campaign-2"
+                   :patch {:item "CTI licences" :quantity 4}}})
+
+      (run actor
+        {:tid "t9" :phase 3 :kind :refusal
+         :label "未登録キャンペーンへの通話記録ログ"
+         :request {:op :log-call-record :campaign-id "campaign-99"
+                   :patch {:calls-handled 1}}})
+
+      (run actor
+        {:tid "t10" :phase 3 :kind :refusal
+         :label "登録済みだが未検証のキャンペーンへの通話記録ログ"
+         :request {:op :log-call-record :campaign-id "campaign-3"
+                   :patch {:calls-handled 1}}})
+
+      (run direct
+        {:tid "t11" :phase 3 :kind :refusal
+         :label "advisor が直接実行を主張 (:effect :commit)"
+         :request {:op :schedule-staffing-operation :campaign-id "campaign-1"
+                   :patch {:shift "2026-08-03-night" :agents 2}}})
+
+      (run actor
+        {:tid "t12" :phase 3 :kind :refusal
+         :label "advisor がプライバシー・コンプライアンス判断へ逸脱"
+         :request {:op :log-call-record :campaign-id "campaign-1"
+                   :out-of-scope? true :patch {}}})
+
+      (run unauth
+        {:tid "t13" :phase 3 :kind :refusal
+         :label "allowlist 外の操作 (発信禁止リスト解除の確定) を提案"
+         :request {:op :log-call-record :campaign-id "campaign-1"
+                   :patch {:calls-handled 3}}})
+
+      (run verdict
+        {:tid "t14" :phase 3 :kind :refusal
+         :label "照会が裁定(:referral/fault)を持ち出した"
+         :request {:op :refer-to-dispute :campaign-id "campaign-2"
+                   :patch sound-referral-patch}})]}))
+
+;; ----------------------------- classification -----------------------------
+
+(defn classify-hold
+  "Classifies ONE ledger fact.
+
+  Fact TYPE first, then the reason -- deliberately never `:violations`
+  alone. `operation`'s `:request-approval` node writes a human's
+  refusal as `{:t :approval-rejected ... :violations [{:rule
+  :approver-rejected}]}`, so a `(seq (:violations f))` test would count
+  a human's decision as a governor refusal. And `:decide` writes a
+  rollout-phase gate with the SAME `:t :governor-hold` as a real
+  refusal, distinguishable only by `:phase-reason` + an empty
+  `:violations`.
+
+  `:violations` is checked before `:phase-reason` on purpose: if a fact
+  ever carried both, the governor did produce violations and that is
+  the substantive refusal. In this codebase they are disjoint --
+  `phase/gate` returns `:reason nil` whenever the governor already
+  held -- but the ordering should not depend on that staying true."
+  [f]
+  (cond
+    (= :approval-rejected (:t f))  :human-rejection
+    (not= :governor-hold (:t f))   :not-a-hold
+    (seq (:violations f))          :governor-hard
+    (:phase-reason f)              :phase-gate
+    :else                          :unclassified-hold))
+
+(defn holds-by-kind
+  "ledger -> {classification [facts..]}. Only hold-shaped facts."
+  [ledger]
+  (dissoc (group-by classify-hold ledger) :not-a-hold))
+
+;; ----------------------------- attribution -----------------------------
+
+(def ^:private approver-keys
+  "Keys that would name WHO approved something.
+
+  `:actor` is deliberately absent. `operation/commit-fact` sets it from
+  `(:actor-id context)` -- the actor that EXECUTED the run -- so it
+  holds the same value on an auto-committed fact and on a
+  human-approved one. `attribution-report` proves that from the run
+  itself rather than asserting it."
+  #{:approved-by :approver :signed-off-by :by})
+
+(defn- approver-entry
+  "The first approver-shaped [k v] in `m`, or nil. Top-level keys only."
+  [m]
+  (when (map? m)
+    (first (keep (fn [k] (when-let [v (get m k)] [k v])) (sort approver-keys)))))
+
+(defn attribution-report
+  "MEASURES, from this run, where an approver's identity survives.
+
+  Nothing here is a fixed claim about this repo: every number is a scan
+  of the ledger and the committed-operations log that this run actually
+  produced. If the store starts retaining the approver, these counts
+  move on their own."
+  [ledger ops-log scenarios]
+  (let [approved     (filterv #(and (= :commit (:disposition %))
+                                    (= :approved (get-in % [:approval :status])))
+                              scenarios)
+        actor-values (into (sorted-set) (keep :actor ledger))
+        committed    (filterv #(= :committed (:t %)) ledger)]
+    {:human-approvals  (count approved)
+     :ops-records      (count ops-log)
+     :payload-retains  (count (filterv #(approver-entry (:payload %)) ops-log))
+     :value-retains    (count (filterv #(approver-entry (:value %)) ops-log))
+     :ledger-facts     (count ledger)
+     :ledger-retains   (count (filterv approver-entry ledger))
+     :committed-facts  (count committed)
+     ;; The evidence that `:actor` is not an approver record: it takes
+     ;; exactly these values across the whole ledger, auto-committed and
+     ;; human-approved facts alike.
+     :actor-values     (vec actor-values)}))
+
+;; ----------------------------- html helpers -----------------------------
+
+(defn- esc [v]
+  (-> (if (nil? v) "" (str v))
+      (str/replace "&" "&amp;")
+      (str/replace "<" "&lt;")
+      (str/replace ">" "&gt;")
+      (str/replace "\"" "&quot;")))
+
+(defn- nm
+  "Renders a keyword/string/number for display. Never leaks `nil`."
+  [v]
+  (cond (nil? v) "—" (keyword? v) (name v) :else (str v)))
+
+(defn- code [v] (str "<code>" (esc (nm v)) "</code>"))
+
+(defn- tag [class text] (str "<span class=\"" class "\">" text "</span>"))
+
+(defn- row [& cells]
+  (str "        <tr>" (str/join (map #(str "<td>" % "</td>") cells)) "</tr>"))
+
+(defn- table [headers rows]
+  (str "    <table>\n"
+       "      <thead><tr>"
+       (str/join (map #(str "<th>" (esc %) "</th>") headers))
+       "</tr></thead>\n"
+       "      <tbody>\n"
+       (if (seq rows) (str (str/join "\n" rows) "\n") "")
+       "      </tbody>\n"
+       "    </table>\n"))
+
+(defn- section [title lede body]
+  (str "  <section class=\"card\">\n"
+       "    <h2>" (esc title) "</h2>\n"
+       (if lede (str "    <p class=\"muted\">" lede "</p>\n") "")
+       body
+       "  </section>\n"))
+
+(defn- disposition-tag [d]
+  (case d
+    :commit   (tag "ok" "commit")
+    :hold     (tag "critical" "hold")
+    :escalate (tag "warn" "escalate")
+    (tag "muted" (esc (nm d)))))
+
+;; ----------------------------- sections -----------------------------
+
+(defn- campaign-rows
+  "One row per campaign in the store's own directory, with the last
+  ledger fact that named it."
+  [ledger campaigns]
+  (for [{:keys [campaign-id client contract-type registered? verified?]} campaigns]
+    (let [last-fact (last (filter #(= campaign-id (:campaign-id %)) ledger))
+          kind      (some-> last-fact classify-hold)]
+      (row (code campaign-id)
+           (esc client)
+           (code contract-type)
+           (if (and registered? verified?)
+             (tag "ok" "registered &amp; verified")
+             (tag "critical" (str (if registered? "registered" "unregistered")
+                                  " / "
+                                  (if verified? "verified" "UNVERIFIED"))))
+           (cond
+             (nil? last-fact)                   (tag "muted" "no activity this run")
+             (= :committed (:t last-fact))      (tag "ok" "committed")
+             (= :governor-hard kind)            (tag "critical" "governor refusal")
+             (= :phase-gate kind)               (tag "warn" "phase gate")
+             (= :human-rejection kind)          (tag "warn" "human rejection")
+             :else                              (tag "muted" (esc (nm (:t last-fact)))))))))
+
+(defn- scenario-rows [scenarios]
+  (for [{:keys [tid label op campaign-id phase pre-approval disposition
+                paused-for-human? approval]} scenarios]
+    (row (code tid)
+         (esc label)
+         (code op)
+         (code campaign-id)
+         (esc (str "phase " phase))
+         (if paused-for-human?
+           (str (disposition-tag pre-approval) " → " (disposition-tag disposition))
+           (disposition-tag disposition))
+         (if approval
+           (esc (str (nm (:status approval)) " · " (nm (:by approval))))
+           (tag "muted" "—")))))
+
+(defn- refusal-rows
+  "One row per VIOLATION (not per fact) so a refusal resting on two
+  independent grounds is visible as two grounds."
+  [facts]
+  (for [f facts
+        v (:violations f)]
+    (row (code (:op f))
+         (code (:campaign-id f))
+         (tag "critical" (esc (nm (:rule v))))
+         (esc (:detail v)))))
+
+(defn- phase-gate-rows [facts]
+  (for [f facts]
+    (row (code (:op f))
+         (code (:campaign-id f))
+         (esc (str "phase " (nm (:phase f))))
+         (code (:phase-reason f))
+         (esc (str (count (:violations f)) " 件")))))
+
+(defn- human-decision-rows [scenarios]
+  (for [{:keys [tid op campaign-id approval disposition]} scenarios
+        :when approval]
+    (row (code tid)
+         (code op)
+         (code campaign-id)
+         (if (= :approved (:status approval))
+           (tag "ok" "approved")
+           (tag "warn" "rejected"))
+         (esc (nm (:by approval)))
+         (disposition-tag disposition))))
+
+(defn- op-contract-rows
+  "Derived from `governor/allowed-ops`, `governor/always-escalate-ops`
+  and `phase/phases` -- the actual vars the running actor consults, so
+  this table cannot drift away from the code it documents."
+  []
+  (let [phase-3 (get phase/phases 3)]
+    (for [op (sort-by name governor/allowed-ops)]
+      (row (code op)
+           (if (contains? (:writes phase-3) op)
+             (tag "ok" "yes")
+             (tag "critical" "no"))
+           (if (contains? (:auto phase-3) op)
+             (tag "ok" "auto-commit when governor-clean")
+             (tag "warn" "human approval always"))
+           (if (contains? governor/always-escalate-ops op)
+             (tag "warn" "ALWAYS escalates, any phase")
+             (tag "muted" "—"))
+           (esc (str/join ", "
+                          (sort (keep (fn [[p {:keys [writes]}]]
+                                        (when (contains? writes op) (str p)))
+                                      phase/phases))))))))
+
+(defn- ledger-rows [ledger]
+  (for [f ledger]
+    (let [kind (classify-hold f)]
+      (row (code (:t f))
+           (code (:op f))
+           (code (:campaign-id f))
+           (case kind
+             :governor-hard     (tag "critical" "governor refusal")
+             :phase-gate        (tag "warn" "rollout-phase gate")
+             :human-rejection   (tag "warn" "human rejection")
+             :unclassified-hold (tag "warn" "hold (unclassified)")
+             (tag "ok" "—"))
+           (esc (or (some->> (:basis f) seq (map nm) (str/join ", ")) "—"))
+           (esc (nm (:confidence f)))))))
+
+(defn- ops-log-rows [ops-log]
+  (for [r ops-log]
+    (row (code (:op r))
+         (code (:campaign-id r))
+         (if-let [[k v] (approver-entry (:payload r))]
+           (esc (str (nm k) " = " (nm v)))
+           (tag "muted" "not retained"))
+         (if-let [[k v] (approver-entry (:value r))]
+           (esc (str (nm k) " = " (nm v)))
+           (tag "muted" "not retained")))))
+
+;; ----------------------------- render -----------------------------
+
+(defn render
+  "Renders the console from a store that has already been run through
+  `run-demo!` plus that run's scenario results."
+  [db scenarios]
+  (let [ledger     (vec (store/ledger db))
+        ops-log    (vec (store/ops-log db))
+        campaigns  (vec (store/all-campaigns db))
+        by-kind    (holds-by-kind ledger)
+        hard       (vec (:governor-hard by-kind))
+        gated      (vec (:phase-gate by-kind))
+        rejected   (vec (:human-rejection by-kind))
+        attrib     (attribution-report ledger ops-log scenarios)
+        rules      (sort (distinct (mapcat #(map :rule (:violations %)) hard)))]
+    (str
+     "<!DOCTYPE html>\n<html lang=\"ja\"><head><meta charset=\"utf-8\">"
+     "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+     "<title>cloud-itonami-isic-8220 · Operator Console</title>\n<style>\n"
+     (jp-go-dds.skin/dds+skin)
+     "\n</style></head>\n<body>\n"
+
+     "<header class=\"bar\">\n"
+     "  <h1>Community Call Centre Operations (ISIC 8220) — Operator Console</h1>\n"
+     "  <p class=\"badge\">"
+     (esc (str "build-time generated by RUNNING the actor · "
+               (count scenarios) " scenarios · "
+               (count ledger) " ledger facts · "
+               (count hard) " governor refusals · "
+               (count gated) " rollout-phase gates · "
+               (count rejected) " human rejections"))
+     "</p>\n"
+     "</header>\n<main>\n"
+
+     (section
+      "この頁の出どころ"
+      (str "すべての行は <code>clojure -M:dev:render-html</code> がこの repo の actor —— "
+           "<code>callcentreops.operation</code> のコンパイル済み langgraph StateGraph "
+           "(<code>langgraph.graph/run*</code>) → <code>callcentreops.governor</code> → "
+           "<code>callcentreops.store</code> —— を "
+           "<code>callcentreops.store/seed-db</code> の実データに対して実行した結果です。"
+           "手で書いた実体・id・判定・数値はありません。時刻や UUID を含まないため、"
+           "同じ seed に対する再実行はバイト単位で同一の頁を生成します。")
+      (table ["面" "値"]
+             [(row "campaigns (store 由来)" (esc (str (count campaigns))))
+              (row "scenarios (この run)" (esc (str (count scenarios))))
+              (row "ledger facts" (esc (str (count ledger))))
+              (row "committed operation records" (esc (str (count ops-log))))
+              (row (tag "critical" "governor refusals (HARD)") (esc (str (count hard))))
+              (row (tag "warn" "rollout-phase gates") (esc (str (count gated))))
+              (row (tag "warn" "human rejections") (esc (str (count rejected))))]))
+
+     (section
+      "クライアント・キャンペーン"
+      (str "<code>callcentreops.store/all-campaigns</code> の内容そのもの。"
+           "governor の <code>campaign-unverified-violations</code> は提案の自己申告ではなく "
+           "この表の <code>:registered?</code>/<code>:verified?</code> を引き直します。")
+      (table ["Campaign" "Client" "Contract" "Verification" "この run の最終事実"]
+             (campaign-rows ledger campaigns)))
+
+     (section
+      "実行したシナリオ"
+      (str "「Disposition」に矢印がある行は、actor が "
+           "<code>interrupt-before #{:request-approval}</code> で実際に停止し、"
+           "人間の判断で再開したものです（承認前 → 最終）。")
+      (table ["Thread" "シナリオ" "Op" "Campaign" "Phase" "Disposition" "人間の判断"]
+             (scenario-rows scenarios)))
+
+     (section
+      (str "Governor による拒否（HARD, 恒久, 覆せない）— " (count hard) " 件")
+      (str "これは <em>governor が提案を拒んだ</em> 事実だけの表です。下の rollout-phase gate "
+           "とは別物で、承認によって覆せません。この run で発火した規則: "
+           (if (seq rules)
+             (str/join "、" (map #(str "<code>" (esc (nm %)) "</code>") rules))
+             "—")
+           "。行は fact 単位ではなく violation 単位なので、独立した 2 つの根拠で拒否された提案は 2 行になります。")
+      (table ["Op" "Campaign" "Rule" "Detail"] (refusal-rows hard)))
+
+     (section
+      (str "Rollout-phase gate（拒否ではない）— " (count gated) " 件")
+      (str "governor は clean だが、その op がその phase でまだ有効化されていないために止まったもの。"
+           "ledger 上は governor による拒否と同じ <code>:t :governor-hold</code> で着地するため、"
+           "<code>classify-hold</code> が <code>:phase-reason</code> と空の <code>:violations</code> "
+           "で区別しています。数え違いを避けるためにこの表を分けています。")
+      (table ["Op" "Campaign" "Phase" "Reason" "Governor violations"]
+             (phase-gate-rows gated)))
+
+     (section
+      "人間の判断"
+      (str "承認も却下も人間の決定であり、governor の拒否ではありません。"
+           "却下は ledger に <code>:t :approval-rejected</code> として着地し、"
+           "<code>{:rule :approver-rejected}</code> という violation を <em>持ちます</em> —— "
+           "<code>:violations</code> だけを見る分類がここで誤ります。")
+      (table ["Thread" "Op" "Campaign" "決定" "決定者" "最終 disposition"]
+             (human-decision-rows scenarios)))
+
+     (section
+      "Op 契約（コードから導出）"
+      (str "<code>callcentreops.governor/allowed-ops</code>・"
+           "<code>governor/always-escalate-ops</code>・<code>callcentreops.phase/phases</code> "
+           "から生成しています。手で書いた説明ではないため、コードが変われば表も変わります。")
+      (table ["Op" "phase 3 で書込可" "phase 3 の自動コミット" "常時エスカレーション" "書込可能な phase"]
+             (op-contract-rows)))
+
+     (section
+      "承認者の帰属（この run から実測）"
+      (str "「誰が承認したか」がどこに残るかを、固定の主張ではなく "
+           "<code>attribution-report</code> による走査で測っています。"
+           "<code>:actor</code> は承認者ではありません —— "
+           "<code>operation/commit-fact</code> が "
+           "<code>(:actor-id context)</code>（<em>実行した</em> actor）を入れるためで、"
+           "この run の ledger 全体で <code>:actor</code> が取る値は "
+           (esc (str/join ", " (map #(str "\"" % "\"") (:actor-values attrib))))
+           " のみです。自動コミットされた事実と人間が承認した事実で同じ値なので、"
+           "この列は承認を識別できません。")
+      (str
+       (table ["測定" "値"]
+              [(row "この run の人間による承認" (esc (str (:human-approvals attrib))))
+               (row "committed operation records" (esc (str (:ops-records attrib))))
+               (row "うち <code>:payload</code> が承認者を保持" (esc (str (:payload-retains attrib))))
+               (row "うち <code>:value</code> が承認者を保持" (esc (str (:value-retains attrib))))
+               (row "ledger facts" (esc (str (:ledger-facts attrib))))
+               (row "うち承認者らしき key を持つもの" (esc (str (:ledger-retains attrib))))])
+       "    <p class=\"" (if (and (pos? (:human-approvals attrib))
+                                  (zero? (:ledger-retains attrib)))
+                           "warn" "muted")
+       "\">"
+       (cond
+         (zero? (:human-approvals attrib))
+         "この run に人間の承認が無いため、帰属は測定できていません。"
+
+         (and (zero? (:ledger-retains attrib)) (pos? (:payload-retains attrib)))
+         (str "測定結果: 追記専用の監査 ledger だけでは「誰が承認したか」に答えられません。"
+              "承認者はコミット済み操作ログの <code>:payload</code> にのみ残っており、"
+              "同じレコードの <code>:value</code> にも ledger にも入りません "
+              "(<code>operation/commit-record</code> は <code>:value</code> に "
+              "<code>(:value proposal)</code> をそのまま入れ、承認者を足すのは "
+              "<code>:payload</code> だけ。<code>:t :approval-granted</code> の監査事実は "
+              "<code>:by</code> を持ちますが <code>store/append-ledger!</code> に渡されません)。"
+              "この repo の実際の欠落として開示します —— 本頁は rendering タスクであり、"
+              "ここで store を書き換えることはしません。")
+
+         (zero? (:ledger-retains attrib))
+         "測定結果: この run では承認者がどこにも残っていません。"
+
+         :else
+         (str "測定結果: ledger が承認者らしき key を "
+              (esc (str (:ledger-retains attrib)))
+              " 件保持しています。"))
+       "</p>\n"
+       (table ["Op" "Campaign" "<code>:payload</code> の承認者" "<code>:value</code> の承認者"]
+              (ops-log-rows ops-log))))
+
+     (section
+      "監査 ledger（この run の全事実）"
+      (str "追記専用の決定事実ログ。「分類」列は <code>classify-hold</code> の出力で、"
+           "fact の型を先に見てから理由を見ます（<code>:violations</code> だけでは"
+           "人間の却下と governor の拒否を取り違えます）。")
+      (table ["Fact" "Op" "Campaign" "分類" "Basis" "Confidence"]
+             (ledger-rows ledger)))
+
+     "</main>\n"
+     "<footer class=\"muted\">\n"
+     "  <p>cloud-itonami-isic-8220 · Community Call Centre Operations · "
+     "生成: <code>clojure -M:dev:render-html</code> · "
+     "AGPL-3.0-or-later</p>\n"
+     "</footer>\n"
+     "</body></html>\n")))
+
+;; ----------------------------- entry point -----------------------------
+
+(defn -main [& args]
+  (let [out (or (first args) "docs/samples/operator-console.html")
+        {:keys [db scenarios]} (run-demo!)
+        ledger  (vec (store/ledger db))
+        by-kind (holds-by-kind ledger)
+        hard    (vec (:governor-hard by-kind))]
+    ;; Build-time invariant, not a convention: a console that shows no
+    ;; HARD governor refusal is not evidence that this actor is
+    ;; governed. Refuse to write the file rather than ship a page whose
+    ;; central claim went unexercised.
+    (when (empty? hard)
+      (throw (ex-info
+              (str "refusing to write " out
+                   ": the run produced zero HARD governor holds, so the"
+                   " console cannot show that the governor can refuse")
+              {:out out
+               :ledger-facts (count ledger)
+               :holds-by-kind (into {} (map (fn [[k v]] [k (count v)]) by-kind))})))
+    (let [html (render db scenarios)]
+      (.mkdirs (java.io.File. (or (.getParent (java.io.File. ^String out)) ".")))
+      (spit out html)
+      (println "wrote" out
+               (str "(" (count html) " chars, "
+                    (count scenarios) " scenarios, "
+                    (count ledger) " ledger facts, "
+                    (count hard) " HARD governor holds, "
+                    (count (:phase-gate by-kind)) " phase gates, "
+                    (count (:human-rejection by-kind)) " human rejections, "
+                    (count (store/ops-log db)) " committed records)"))
+      (doseq [[rule n] (sort-by key (frequencies (map :rule (mapcat :violations hard))))]
+        (println "  HARD hold rule:" rule "x" n)))))
