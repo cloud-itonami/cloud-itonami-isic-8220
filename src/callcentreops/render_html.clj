@@ -46,7 +46,7 @@
   clock. Rerunning against the same seed produces a byte-identical
   file."
   (:require [jp-go-dds.skin]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [langgraph.graph :as g]
             [callcentreops.advisor :as advisor]
             [callcentreops.governor :as governor]

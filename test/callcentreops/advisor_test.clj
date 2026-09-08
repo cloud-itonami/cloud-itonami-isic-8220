@@ -1,6 +1,6 @@
 (ns callcentreops.advisor-test
   "Unit tests of `callcentreops.advisor` proposal generation."
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [clojure.test :refer [deftest is testing]]
             [callcentreops.advisor :as adv]
             [callcentreops.store :as store]))
@@ -67,7 +67,7 @@
     (doseq [op [:log-call-record :schedule-staffing-operation
                 :coordinate-equipment-supply :flag-privacy-concern]]
       (let [p (adv/infer db {:op op :campaign-id "campaign-1" :patch {:concern "unconfirmed do-not-call request"}})
-            blob (str/lower-case (pr-str (select-keys p [:summary :rationale :value])))]
+            blob (str/lower (pr-str (select-keys p [:summary :rationale :value])))]
         (is (not (str/includes? blob "gdpr")))
         (is (not (str/includes? blob "compliance decision")))
         (is (not (str/includes? blob "do-not-call override finalized")))
@@ -77,7 +77,7 @@
   (testing "the test-only out-of-scope? hook produces text the governor's scope-exclusion scan WILL catch (sanity check on the hook itself)"
     (let [p (adv/infer db {:op :log-call-record :campaign-id "campaign-1"
                            :out-of-scope? true :patch {}})
-          blob (str/lower-case (pr-str (select-keys p [:summary :rationale :value])))]
+          blob (str/lower (pr-str (select-keys p [:summary :rationale :value])))]
       (is (or (str/includes? blob "発信禁止リスト解除確定")
               (str/includes? blob "同意撤回解決確定"))
           "out-of-scope? hook must actually poison the rationale with excluded-scope content"))))
