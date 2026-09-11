@@ -39,7 +39,7 @@
      (`attribution-report`), never asserted as a fixed property of this
      repo. If someone fixes the store, the page follows.
 
-  Usage: `clojure -M:dev:render-html [out-file]`
+  Usage: `kbb -M:dev:render-html [out-file]`
   (default `docs/samples/operator-console.html`).
 
   The page is deterministic: no timestamps, no per-run UUIDs, no wall
@@ -541,7 +541,7 @@
 
      (section
       "この頁の出どころ"
-      (str "すべての行は <code>clojure -M:dev:render-html</code> がこの repo の actor —— "
+      (str "すべての行は <code>kbb -M:dev:render-html</code> がこの repo の actor —— "
            "<code>callcentreops.operation</code> のコンパイル済み langgraph StateGraph "
            "(<code>langgraph.graph/run*</code>) → <code>callcentreops.governor</code> → "
            "<code>callcentreops.store</code> —— を "
@@ -669,7 +669,7 @@
      "</main>\n"
      "<footer class=\"muted\">\n"
      "  <p>cloud-itonami-isic-8220 · Community Call Centre Operations · "
-     "生成: <code>clojure -M:dev:render-html</code> · "
+     "生成: <code>kbb -M:dev:render-html</code> · "
      "AGPL-3.0-or-later</p>\n"
      "</footer>\n"
      "</body></html>\n")))

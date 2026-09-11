@@ -37,9 +37,9 @@
  ops auto-commit only once phase 3 (supervised-auto) is reached and
  the Governor is clean. Every commit/hold/approval-rejected decision
  lands in the append-only ledger -- 50 tests / 158 assertions green
- (`clojure -M:dev:test`) covering the governor's hard checks, the
+ (`kbb -M:dev:test`) covering the governor's hard checks, the
  scope-exclusion self-trip regression, phase gating, MemStore ≡
  DatomicStore parity, and a full compiled-StateGraph integration suite
  (clean commit, escalate→approve→commit, escalate→reject→hold, and
  four independent HARD-hold paths); demo runnable end-to-end
- (`clojure -M:run`)."}
+ (`kbb -M:run`)."}
