@@ -1,0 +1,35 @@
+;; What this vertical's robot physically does, declared for
+;; kotoba.robotics.process (kotoba-lang/robotics). `kbb -M:dev:physics` runs it.
+;;
+;; README "Robotics premise": in a contact-centre business (ISIC 8220) the
+;; industry's colloquial "robot" is the voice/chat bot doing first-line
+;; intake triage and screen-pop preparation -- software, not hardware. The
+;; physical work a robot does on a contact-centre floor is floor logistics
+;; and seat staging: a cart delivering sanitized headsets and spare
+;; equipment to agent pods, and an arm staging a replacement agent
+;; workstation onto a desk before a shift.
+;;
+;; Every number without a cited source is marked `estimate` in its :basis.
+;; Replacing an estimate with a sourced value is this bot's growth work.
+{:physics/schema "itonami.physical-ai.spec.v1"
+ :repo "cloud-itonami/cloud-itonami-isic-8220"
+ :cases
+ [{:id :headset-cart-to-agent-pod
+   :kind :transport
+   :procedure "floor cart robot delivers sanitized headsets and spare peripherals from the IT cage to an agent pod before shift change"
+   :params {:mass-kg 35.0 :payload-kg 8.0 :v-max-mps 1.0 :a-max-mps2 0.5
+            :brake-decel-mps2 0.8 :drive-force-n 70.0 :crr 0.02
+            :cog-height-m 0.50 :support-half-length-m 0.25 :max-time-s 1800.0}
+   :sweep {:param :distance-m :values [15.0 30.0 50.0 80.0 120.0]}
+   :quantity :cycle-time-s
+   :limit {:max 75.0 :basis "estimate: headsets must reach the pod within the shift-change overlap of about 5 minutes per round of 4 pods"}
+   :boundary {:lo 5.0 :hi 300.0}}
+  {:id :workstation-onto-agent-desk
+   :kind :manipulator
+   :procedure "arm lifts a replacement small-form-factor agent workstation from the cart deck onto the agent desk"
+   :params {:l1-m 0.55 :l2-m 0.45 :m1-kg 5.0 :m2-kg 3.5
+            :from [0.55 -0.25] :to [0.60 0.25] :duration-s 2.5 :steps 500}
+   :sweep {:param :payload-kg :values [2.0 4.0 6.0 9.0 12.0]}
+   :quantity :peak-tau1-nm
+   :limit {:max 90.0 :basis "estimate: continuous shoulder torque of a mid-size collaborative arm (~7-10 kg payload class)"}
+   :boundary {:lo 0.5 :hi 30.0}}]}
